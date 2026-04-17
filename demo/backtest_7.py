@@ -1,5 +1,5 @@
 ############################################################################
-### QPMwP CODING EXAMPLES - Backtest 6: ScoreVariance
+### QPMwP CODING EXAMPLES - Backtest 7: ScoreVariance with ML-based signal
 ############################################################################
 
 # --------------------------------------------------------------------------
@@ -14,7 +14,7 @@
 # This script demonstrates how to run a backtest using the qpmwp-course library
 # and single stock data which change over time.
 
-# The script uses the 'ScoreVariance' portfolio optimization classes.
+# The script uses the 'ScoreVariance' portfolio optimization class and a ML-based signal.
 
 
 
@@ -38,9 +38,11 @@ sys.path.append(src_path)
 from helper_functions import (
     load_pickle,
     load_data_spi,
+    load_jkp_factor_series,
+    align_market_data_with_jkp_data,
 )
 from estimation.covariance import Covariance
-from optimization.optimization import ScoreVariance              # NEW
+from optimization.optimization import ScoreVariance
 from backtesting.backtest_item_builder.bib_classes import (
     SelectionItemBuilder,
     OptimizationItemBuilder,
@@ -48,11 +50,11 @@ from backtesting.backtest_item_builder.bib_classes import (
 from backtesting.backtest_item_builder.bibfn_selection import (
     bibfn_selection_gaps,
     bibfn_selection_min_volume,
-    bibfn_selection_jkp_data_scores,                             # NEW
+    bibfn_selection_jkp_data_scores,
 )
 from backtesting.backtest_item_builder.bibfn_optimization_data import (
     bibfn_return_series,
-    bibfn_scores,                                                # NEW
+    bibfn_scores,
 )
 from backtesting.backtest_item_builder.bibfn_constraints import (
     bibfn_budget_constraint,
@@ -77,81 +79,78 @@ WIDTH_3Y = 365 * 3
 
 
 
+
+
 # --------------------------------------------------------------------------
 # Load data
 # - market data (from parquet file)
 # - jkp data (from parquet file)
 # - swiss performance index, SPI (from csv file)
+# - ML signal (from parquet file)
 # --------------------------------------------------------------------------
-
 
 # Load market and jkp data from parquet files
 market_data = pd.read_parquet(path = f'{PATH_TO_DATA}market_data.parquet')
 jkp_data = pd.read_parquet(path = f'{PATH_TO_DATA}jkp_data.parquet')
+spi = load_data_spi(path='../data/')
 
-list(jkp_data.columns)
+# Load ML signal and add to jkp_data (so that we can use it in the backtest)
+ml_signal = pd.read_parquet(path=f'{PATH_TO_DATA}ml_signal.parquet')
+ml_signal = ml_signal.stack().squeeze()
+ml_signal.name = 'ml_signal'
+ml_signal.index.names = jkp_data.index.names
 
+# Add the ml_signal to jkp_data
+jkp_data = jkp_data.join(ml_signal, how='left')
 
-
-# --------------------------------------------------------------------------
-# Prepare backtest service
-# --------------------------------------------------------------------------
-
-# -------------------------
-# Allign market and jkp data on the same dates
-# See backtest_4.py for details
-# -------------------------
-
-market_data_dates = (
-    market_data
-    .index.get_level_values('date')
-    .unique().sort_values()
+# Align market data with jkp data
+market_data_ffill, jkp_data = align_market_data_with_jkp_data(
+    market_data=market_data,
+    jkp_data=jkp_data,
 )
+
+
+
+# --------------------------------------------------------------------------
+# Instantiate the BacktestData class
+# and set the market, jkp, and benchmark data as attributes
+# --------------------------------------------------------------------------
+
+data = BacktestData()
+data.market_data = market_data_ffill  # notice that we use the forward filled market data here
+data.jkp_data = jkp_data
+data.bm_series = spi
+
+
+
+# --------------------------------------------------------------------------
+# Define rebalancing dates
+# --------------------------------------------------------------------------
+
+n_month = 3 # We want to rebalance every n_month months
 jkp_data_dates = (
     jkp_data
     .index.get_level_values('date')
     .unique().sort_values()
 )
-missing_dates = jkp_data_dates[~jkp_data_dates.isin(market_data_dates)]
-tmp_dict = {}
-for date in missing_dates:
-    last_date = market_data_dates[market_data_dates <= date][-1]
-    tmp_dict[date] = market_data.loc[last_date]
-    
-df_missing = pd.concat(tmp_dict, axis=0)
-df_missing.index.names = market_data.index.names
-market_data_ffill = pd.concat([market_data, df_missing]).sort_index()
-
-# Define rebalancing dates
-n_month = 3 # We want to rebalance every n_month months
 rebdates = (
     jkp_data_dates[
-        jkp_data_dates > market_data_dates[0]
+        jkp_data_dates > market_data.index.get_level_values('date').min()
     ][::n_month]
     .strftime('%Y-%m-%d').tolist()
 )
-rebdates = [date for date in rebdates if date > '2002-01-01']
+rebdates = [
+    date for date in rebdates if date > '2002-01-01'
+    and date < rebdates[-1]
+]
 rebdates
 
 
 
 
-# -------------------------
-# Instantiate the BacktestData class
-# and set the market, jkp, and benchmark data as attributes
-# -------------------------
-
-data = BacktestData()
-data.market_data = market_data_ffill  # notice that we use the forward filled market data here
-data.jkp_data = jkp_data
-data.bm_series = load_data_spi(path='../data/')
-
-
-
-
-# -------------------------
+# --------------------------------------------------------------------------
 # Define the selection item builders.
-# -------------------------
+# --------------------------------------------------------------------------
 
 selection_item_builders = {
     'gaps': SelectionItemBuilder(
@@ -161,22 +160,22 @@ selection_item_builders = {
     ),
     'min_volume': SelectionItemBuilder(
         bibfn=bibfn_selection_min_volume,
-        width=WIDTH_3Y,
+        width=365,
         min_volume=500_000,
         agg_fn=np.median,
     ),
-    'jkp_data_scores': SelectionItemBuilder(                          # NEW
-        bibfn=bibfn_selection_jkp_data_scores,    
-        fields=['qmj'], #, 'qmj_prof', 'qmj_growth', 'qmj_safety'],   # See jkp_data.columns for available fields
+    'jkp_data_scores': SelectionItemBuilder(
+        bibfn=bibfn_selection_jkp_data_scores,
+        fields=['ml_signal'],
     ),
 }
 
 
 
 
-# -------------------------
+# --------------------------------------------------------------------------
 # Define the optimization item builders.
-# -------------------------
+# --------------------------------------------------------------------------
 
 optimization_item_builders = {
     'return_series': OptimizationItemBuilder(
@@ -185,8 +184,8 @@ optimization_item_builders = {
         fill_value=0,
     ),
     'scores': OptimizationItemBuilder(
-        bibfn=bibfn_scores,                                          # NEW
-        fields=['qmj'], #, 'qmj_prof', 'qmj_growth', 'qmj_safety'],
+        bibfn=bibfn_scores,
+        fields=['ml_signal'],
     ),
     'budget_constraint': OptimizationItemBuilder(
         bibfn=bibfn_budget_constraint,
@@ -223,7 +222,7 @@ bs = BacktestService(
 
 # Update the backtest service with a ScoreVariance optimization object
 
-field_name = 'qmj'  # <change this to your desired field name from jkp_data>
+field_name = 'ml_signal'  # <change this to your desired field name from jkp_data>
 
 bs.optimization = ScoreVariance(
     field=field_name,
@@ -241,16 +240,8 @@ bt_sv.run(bs=bs)
 # # Save the backtest as a .pickle file
 # bt_sv.save(
 #     path=SAVE_PATH,
-#     filename=f'demo_backtest_4_sv_{field_name}.pickle' # <change this to your desired filename>
+#     filename=f'demo_backtest_xxx_sv_{field_name}.pickle' # <change this to your desired filename>
 # )
-
-
-
-
-
-
-
-
 
 
 
@@ -261,10 +252,6 @@ bt_sv.run(bs=bs)
 # --------------------------------------------------------------------------
 
 # Laod backtests from pickle
-bt_mv = load_pickle(
-    filename='demo_backtest_4_mv.pickle',
-    path=SAVE_PATH,
-)
 bt_sv = load_pickle(
     filename=f'demo_backtest_4_sv_{field_name}.pickle',
     path=SAVE_PATH,
@@ -275,11 +262,6 @@ fixed_costs = 0
 variable_costs = 0
 return_series = bs.data.get_return_series()
 
-sim_mv = bt_mv.strategy.simulate(
-    return_series=return_series,
-    fc=fixed_costs,
-    vc=variable_costs
-)
 sim_sv = bt_sv.strategy.simulate(
     return_series=return_series,
     fc=fixed_costs,
@@ -289,10 +271,9 @@ sim_sv = bt_sv.strategy.simulate(
 # Concatenate the simulations
 sim = pd.concat({
     'bm': bs.data.bm_series,
-    'mv': sim_mv,
     f'sv_{field_name}': sim_sv,
 }, axis=1).dropna()
-sim.columns = ['Benchmark', 'Mean-Variance', f'Score Variance ({field_name})']
+sim.columns = ['Benchmark', f'Score Variance ({field_name})']
 
 
 # Plot the cumulative performance
